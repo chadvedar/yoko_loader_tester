@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 import time
 import threading
-
 import rclpy
+import numpy as np
+
 from rclpy.node import Node
-from rclpy.action import ActionClient
-from rclpy.action import ActionServer
+from rclpy.action import ActionServer, CancelResponse
 from rclpy.action.server import ServerGoalHandle
 
-from wheel_loader_navigation.action import ForwardBucket
 from yoko_loader_tester.action import Trigger
 from std_msgs.msg import Bool, Int32, Int16, Float64
 
+def pulse_bool(publisher):
+    msg = Bool()
+    msg.data = True
+    publisher.publish(msg)
+
+    time.sleep(0.1)
+
+    msg.data = False
+    publisher.publish(msg)
+    
 class ArmPLCController:
     def __init__(self, node:Node):
         self.node = node
@@ -24,21 +33,11 @@ class ArmPLCController:
         self.pub_arm_move = self.node.create_publisher(Bool, '/arm/arm_move_to_pos', 10)
         self.pub_bucket_move = self.node.create_publisher(Bool, '/arm/bucket_move_to_pos', 10)
 
-        node.create_subscription(Bool, "/arm/is_arm_reached_target", self.arm_reached_callback, 10)
-        node.create_subscription(Bool, "/arm/is_bucket_reached_target", self.bucket_reached_callback, 10)
+        self.node.create_subscription(Bool, "/arm/is_arm_reached_target", self.arm_reached_callback, 10)
+        self.node.create_subscription(Bool, "/arm/is_bucket_reached_target", self.bucket_reached_callback, 10)
 
         self.is_arm_reached = False
         self.is_bucket_reached = False
-
-    def pulse_bool(self, publisher):
-        msg = Bool()
-        msg.data = True
-        publisher.publish(msg)
-
-        time.sleep(0.1)
-
-        msg.data = False
-        publisher.publish(msg)
 
     def set_enable_arm_ctrl(self):
         msg = Bool()
@@ -83,18 +82,18 @@ class ArmPLCController:
         self.pub_bucket_target_pos.publish(msg)
 
     def set_arm_move(self):
-        self.pulse_bool(self.pub_arm_move)
+        pulse_bool(self.pub_arm_move)
 
     def set_bucket_move(self):
-        self.pulse_bool(self.pub_bucket_move)
+        pulse_bool(self.pub_bucket_move)
 
-    def wait_until_reached(self, is_reached:bool, timeout:float=5.0):
+    def wait_until_reached(self, is_reached:callable, timeout:float=5.0):
         start_time = time.time()
         while time.time() - start_time < timeout:
             
             time.sleep(0.1)
 
-            if is_reached:
+            if is_reached():
                 return True
             
         return False
@@ -111,15 +110,15 @@ class ArmPLCController:
             self.set_bucket_target_pos(j2)
             self.set_bucket_move()
 
+        j1_ret = True
         if j1 is not None:
-            if self.wait_until_reached(self.is_arm_reached):
-                return True
+            j1_ret = self.wait_until_reached(lambda : self.is_arm_reached)
 
+        j2_ret = True
         if j2 is not None:
-            if self.wait_until_reached(self.is_bucket_reached):
-                return True
+            j2_ret = self.wait_until_reached(lambda : self.is_bucket_reached)
             
-        return False
+        return j1_ret and j2_ret
 
     def arm_reached_callback(self, msg:Bool):
         if msg.data:
@@ -135,24 +134,136 @@ class ArmPLCController:
         else:
             self.is_bucket_reached = False
 
+class VehicleMotionController:
+    def __init__(self, node:Node, kp:float, ki:float, kd:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float, tol:float=0.1):
+        self.node = node
+
+        self.pub_linear_spd  = self.node.create_publisher(Float64, '/vehicle/set_target_spd', 10)
+        self.pub_linear_mov  = self.node.create_publisher(Bool,    '/vehicle/move',           10)
+        self.pub_linear_stop = self.node.create_publisher(Bool,    '/vehicle/stop_move',      10)
+
+        self.node.create_subscription(Float64, "/vehicle/speed", self.vehicle_speed_callback, 10)
+
+        self._vehicle_spd  : float = 0.0
+        self._vehicle_dist : float = 0.0
+
+        self.reset()
+        self.set_control_gain(kp, ki, kd)
+        self.set_control_limit(max_cmd, min_cmd, max_i, min_i)
+        self.tol = tol
+
+    def set_control_gain(self, kp:float, ki:float, kd:float):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+
+    def set_control_limit(self, max_cmd:float, min_cmd:float, max_i:float, min_i:float):
+        self.max_cmd = max_cmd
+        self.min_cmd = min_cmd
+        self.max_i   = max_i
+        self.min_i   = min_i
+
+    def reset(self):
+        self._vehicle_spd  = 0.0
+        self._vehicle_dist = 0.0
+        self.err           = 0.0
+        self.err_i         = 0.0
+        self.err_d         = 0.0
+        self.err_prev      = 0.0
+        self.is_cancled    = False
+
+    def compute_vehicle_dist(self, dt):
+        self._vehicle_dist += self._vehicle_spd * dt
+
+    def vehicle_speed_callback(self, msg:Float64):
+        self._vehicle_spd = msg.data
+
+    def execute(self, target_pos:float):
+        process = threading.Thread(target=self.control_pos, args=(target_pos,), daemon=True)
+        process.start()
+    
+    def control_pos(self, target_pos:float, timeout:float=5.0):
+
+        start_time = time.time()
+        prev_time = start_time
+
+        self.node._logger.info(f"VehicleMotionControl receive target position = [{target_pos}]")
+        while not self.is_cancled:
+            now_time = time.time()
+            dt = now_time - prev_time
+            prev_time = now_time
+
+            time_elapse = now_time - start_time
+            if time_elapse > timeout:
+                self.is_cancled = True
+                break
+
+            v_cmd, err = self.control_law(target_pos = target_pos, dt = dt)
+            self.set_linear_spd(v_cmd)
+
+            self.compute_vehicle_dist(dt)
+            if abs(err) < self.tol:
+                self.set_linear_stop_mov()
+                break
+
+        ret = True
+        if self.is_cancled:
+            ret = False
+        else:
+            self.node._logger.info(f"VehicleMotionControl target position [{target_pos}] is finished")
+
+        self.reset()
+        return ret
+
+    def control_law(self, 
+                    target_pos : float, 
+                    dt         : float,
+                    ):
+    
+        self.err      = target_pos - self._vehicle_dist
+
+        self.err_i   += self.err * dt
+        self.err_i    = np.clip(self.err_i, self.min_i, self.max_i)
+
+        self.err_d    = (self.err - self.err_prev)/dt
+        self.err_prev = self.err
+
+        v_cmd         = self.kp * self.err + self.ki * self.err_i + self.kd * self.err_d
+        v_cmd         = np.clip(v_cmd, self.min_cmd, self.max_cmd)
+
+        return v_cmd, self.err
+
+    def set_linear_spd(self, spd:float):
+        msg_spd = Float64()
+        msg_spd.data = spd
+        self.pub_linear_spd.publish(msg_spd)
+        pulse_bool(self.pub_linear_mov)
+
+    def set_linear_stop_mov(self):
+        pulse_bool(self.pub_linear_stop)
+    
 class SequenceExecutor(Node):
 
     def __init__(self):
-        super().__init__("sequence_executor")
+        super().__init__("load_unload_action_server")
 
         self.armController = ArmPLCController(self)
-
+        self.vehicleControlller = VehicleMotionController(
+            node    = self,
+            kp      =  1.0,
+            ki      =  0.0,
+            kd      =  0.0,
+            max_cmd =  3.0,
+            min_cmd = -3.0,
+            max_i   =  10.0,
+            min_i   = -10.0 
+        )
+        
         self.action_server = ActionServer(
             node             = self,
             action_type      = Trigger,
             action_name      = "/arm_loader/execute_sequence",
-            execute_callback = self.execute_loader_goal
-        )
-
-        self.vehicle_client = ActionClient(
-            self,
-            ForwardBucket,
-            "/forward_bucket"
+            execute_callback = self.execute_loader_goal,
         )
 
         self.targets = [
@@ -165,50 +276,26 @@ class SequenceExecutor(Node):
 
         self.action_mutex = threading.Lock()
 
+        self.state_reset()
 
-    def send_vehicle_goal(self, x):
-
-        self.vehicle_client.wait_for_server()
-
-        goal = ForwardBucket.Goal()
-        goal.distance = x
-
-        send_goal_future = self.vehicle_client.send_goal_async(goal)
-
-        self.action_mutex.acquire()
-        rclpy.spin_until_future_complete(self, send_goal_future)
-        self.action_mutex.release()
-
-        goal_handle = send_goal_future.result()
-
-        if not goal_handle.accepted:
-            self.get_logger().error("Vehicle goal rejected")
-            return False
-
-        self.get_logger().info(f"Vehicle goal accepted: x={x}")
-
-        result_future = goal_handle.get_result_async()
-
-        self.action_mutex.acquire()
-        rclpy.spin_until_future_complete(self, result_future)
-        self.action_mutex.release()
-
-        result = result_future.result()
-
-        if result.status == 4:
-            self.get_logger().info("Vehicle action succeeded")
-            return True
-
-        self.get_logger().error("Vehicle action failed")
-        return False
+    def state_reset(self):
+        self.loader_traj_point_no = -1
+        self.loader_traj_is_done  = True
+        self.is_cancled = False
+    
+    def send_vehicle_goal(self, target_pos:float):
+        return self.vehicleControlller.control_pos(target_pos)
 
     def execute_sequence(self):
 
         for idx, (x, j1, j2) in enumerate(self.targets):
 
-            self.get_logger().info(
-                f"########### Execute Target {idx+1}/{len(self.targets)} ####################\n"
-            )
+            if self.is_cancled:
+                break
+            
+            self.get_logger().info(f"Execute Target {idx+1}/{len(self.targets)}")
+            self.loader_traj_point_no = idx
+            self.loader_traj_is_done = False
 
             vehicle_success = False
             loader_success = False
@@ -237,12 +324,15 @@ class SequenceExecutor(Node):
 
             vehicle_success = self._vehicle_result
             loader_success = self._loader_result
-
-            vehicle_success = True
+            
             if not (vehicle_success and loader_success):
                 self.get_logger().error(
                     "One of the actions failed. Stopping sequence."
                 )
+                self.get_logger().error(
+                    f"vehicle_control result = [{vehicle_success}] | arm_control result = [{loader_success}]"
+                )
+                self.is_cancled = True
                 return
 
             self.get_logger().info(
@@ -251,7 +341,10 @@ class SequenceExecutor(Node):
 
             time.sleep(1.0)
 
-        self.get_logger().info("All targets completed.")
+        if not self.is_cancled:
+            self.get_logger().info("All targets completed.")
+
+        self.state_reset()
 
     def execute_loader_goal(self, goal_handle: ServerGoalHandle):
         self.get_logger().info("Received request to execute loader sequence.")
@@ -262,6 +355,7 @@ class SequenceExecutor(Node):
         feedback = Trigger.Feedback()
         result = Trigger.Result()
 
+        self.loader_traj_is_done  = False
         try:
             while rclpy.ok():
                 if goal_handle.is_cancel_requested:
@@ -271,15 +365,21 @@ class SequenceExecutor(Node):
                     result.success = False
                     return result
 
-                is_done, state_num = self.get_sequence_state()
+                is_done, is_cancled ,state_num = self.get_sequence_state()
                 feedback.state_num = state_num  
                 goal_handle.publish_feedback(feedback)
+
+                if is_cancled:
+                    self.get_logger().error("Loader sequence is canceled.")
+                    goal_handle.abort()
+                    result.success = False
+                    self.state_reset()
+                    return result
 
                 if is_done:
                     self.get_logger().info("Loader sequence completed successfully.")
                     break
 
-                rclpy.spin_once(self)
                 time.sleep(0.05)
 
         except Exception as e:
@@ -293,18 +393,21 @@ class SequenceExecutor(Node):
         return result
 
     def sequence_cancel_callback(self):
-        raise NotImplementedError("Sequence cancel callback not implemented.")
+        self.is_cancled = True
+        self.vehicleControlller.is_cancled = True
 
     def get_sequence_state(self):
-        raise NotImplementedError("Get sequence state method not implemented.")
+        return self.loader_traj_is_done, self.is_cancled, self.loader_traj_point_no
     
 def main(args=None):
     rclpy.init(args=args)
 
     node = SequenceExecutor()
-    node.execute_sequence()
-    node.destroy_node()
+    node.get_logger().info("Wheel loader action server for load/unload start!!")
 
+    rclpy.spin(node)
+
+    node.destroy_node()
     rclpy.shutdown()
 
 
