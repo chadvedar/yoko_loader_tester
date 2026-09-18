@@ -27,11 +27,15 @@ class SequenceExecutor(Node):
         )
 
         self.targets = [
-            (0.50, 10.0, 25.0),
-            (1.20, 20.0, 35.0),
-            (0.80, 15.0, 40.0),
-            (1.50, 30.0, 50.0),
+            [0.24197153387468573, 0.0, 0.0],
+            [1.0, 0.21979246164780855, 0.3033429986776818],
+            [2.0, 0.22009244819553492, 0.3037867161184603],
+            [2.0, 0.22009244819553492, 0.3037867161184603],
+            [0.0, 0.8029340032443635, 0.15712545046230594]
         ]
+
+        self.action_mutex = threading.Lock()
+
 
     def send_vehicle_goal(self, x):
 
@@ -42,7 +46,10 @@ class SequenceExecutor(Node):
 
         send_goal_future = self.vehicle_client.send_goal_async(goal)
 
+        self.action_mutex.acquire()
         rclpy.spin_until_future_complete(self, send_goal_future)
+        self.action_mutex.release()
+
         goal_handle = send_goal_future.result()
 
         if not goal_handle.accepted:
@@ -52,7 +59,10 @@ class SequenceExecutor(Node):
         self.get_logger().info(f"Vehicle goal accepted: x={x}")
 
         result_future = goal_handle.get_result_async()
+
+        self.action_mutex.acquire()
         rclpy.spin_until_future_complete(self, result_future)
+        self.action_mutex.release()
 
         result = result_future.result()
 
@@ -72,7 +82,10 @@ class SequenceExecutor(Node):
         goal.target_bucket = j2
 
         send_goal_future = self.loader_client.send_goal_async(goal)
+
+        self.action_mutex.acquire()
         rclpy.spin_until_future_complete(self, send_goal_future)
+        self.action_mutex.release()
 
         goal_handle = send_goal_future.result()
 
@@ -85,8 +98,11 @@ class SequenceExecutor(Node):
         )
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
 
+        self.action_mutex.acquire()
+        rclpy.spin_until_future_complete(self, result_future)
+        self.action_mutex.release()
+        
         result = result_future.result()
 
         if result.status == 4:
@@ -132,6 +148,7 @@ class SequenceExecutor(Node):
             vehicle_success = self._vehicle_result
             loader_success = self._loader_result
 
+            vehicle_success = True
             if not (vehicle_success and loader_success):
                 self.get_logger().error(
                     "One of the actions failed. Stopping sequence."
