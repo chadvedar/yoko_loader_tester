@@ -9,7 +9,7 @@ from rclpy.action import ActionServer, CancelResponse
 from rclpy.action.server import ServerGoalHandle
 
 from yoko_loader_tester.action import Trigger
-from std_msgs.msg import Bool, Int32, Int16, Float64
+from std_msgs.msg import Bool, Int32, Int16, Float64, Float64MultiArray
 
 def pulse_bool(publisher):
     msg = Bool()
@@ -52,6 +52,7 @@ class SequenceExecutor(Node):
         self.create_subscription(Float64, "/vehicle/speed",                lambda msg : self.vehicle_speed_callback(msg),  10)
         self.create_subscription(Bool,    "/arm/is_arm_reached_target",    lambda msg : self.arm_reached_callback(msg),    10)
         self.create_subscription(Bool,    "/arm/is_bucket_reached_target", lambda msg : self.bucket_reached_callback(msg), 10)
+        self.create_subscription(Float64MultiArray, "/loader_target_position", self.loader_target_pos_callback, 10)
 
         self.vehicle_speed_callback  = self.vehicleControlller.vehicle_speed_callback
         self.arm_reached_callback    = self.armController.arm_reached_callback
@@ -84,6 +85,9 @@ class SequenceExecutor(Node):
 
     def bucket_reached_callback(self, msg:Bool):
         raise NotImplementedError
+
+    def loader_target_pos_callback(self, msg:Float64MultiArray):
+        self.targets = np.array(msg.data).reshape(-1,3)
     
     def state_reset(self):
         self.loader_traj_point_no = -1
