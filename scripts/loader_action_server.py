@@ -128,13 +128,13 @@ class SequenceExecutor(Node):
                 )
             )
 
-            # vehicle_thread.start()
+            vehicle_thread.start()
             loader_thread.start()
 
-            # vehicle_thread.join()
+            vehicle_thread.join()
             loader_thread.join()
-            vehicle_success = True
-            # vehicle_success = self._vehicle_result
+
+            vehicle_success = self._vehicle_result
             loader_success = self._loader_result
             
             if not (vehicle_success and loader_success):
@@ -332,7 +332,7 @@ class ArmPLCController:
             self.is_bucket_reached = False
 
 class VehicleMotionController:
-    def __init__(self, node:SequenceExecutor, kp:float, ki:float, kd:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float, tol:float=0.1):
+    def __init__(self, node:SequenceExecutor, kp:float, ki:float, kd:float, sat_cmd:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float, tol:float=0.1):
         self.node = node
 
         self._vehicle_spd  : float = 0.0
@@ -340,7 +340,7 @@ class VehicleMotionController:
 
         self.reset()
         self.set_control_gain(kp, ki, kd)
-        self.set_control_limit(max_cmd, min_cmd, max_i, min_i)
+        self.set_control_limit(sat_cmd, max_cmd, min_cmd, max_i, min_i)
         self.tol = tol
 
     def set_control_gain(self, kp:float, ki:float, kd:float):
@@ -348,7 +348,8 @@ class VehicleMotionController:
         self.ki = ki
         self.kd = kd
 
-    def set_control_limit(self, max_cmd:float, min_cmd:float, max_i:float, min_i:float):
+    def set_control_limit(self, sat_cmd:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float):
+        self.sat_cmd = sat_cmd
         self.max_cmd = max_cmd
         self.min_cmd = min_cmd
         self.max_i   = max_i
@@ -413,15 +414,17 @@ class VehicleMotionController:
     
         self.err      = target_pos - self._vehicle_dist
 
-        self.err_i   += self.err * dt
-        self.err_i    = np.clip(self.err_i, self.min_i, self.max_i)
+        # self.err_i   += self.err * dt
+        # self.err_i    = np.clip(self.err_i, self.min_i, self.max_i)
 
-        self.err_d    = (self.err - self.err_prev)/dt
-        self.err_prev = self.err
+        # self.err_d    = (self.err - self.err_prev)/dt
+        # self.err_prev = self.err
 
-        v_cmd         = self.kp * self.err + self.ki * self.err_i + self.kd * self.err_d
-        v_cmd         = np.clip(v_cmd, self.min_cmd, self.max_cmd)
+        # v_cmd         = self.kp * self.err + self.ki * self.err_i + self.kd * self.err_d
+        # v_cmd         = np.clip(v_cmd, self.min_cmd, self.max_cmd)
 
+        v_cmd = self.sat_cmd if self.err > 0 else -self.sat_cmd
+        v_cmd = np.clip(v_cmd, self.min_cmd, self.max_cmd)
         return v_cmd, self.err
 
     def set_linear_spd(self, spd:float):
