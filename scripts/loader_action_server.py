@@ -21,20 +21,213 @@ def pulse_bool(publisher):
     msg.data = False
     publisher.publish(msg)
     
+class SequenceExecutor(Node):
+
+    def __init__(self):
+        super().__init__("load_unload_action_server")
+
+        self.armController      = ArmPLCController(self)
+        self.vehicleControlller = VehicleMotionController(
+            node    =  self,
+            kp      =  1.0,
+            ki      =  0.0,
+            kd      =  0.0,
+            max_cmd =  3.0,
+            min_cmd = -3.0,
+            max_i   =  10.0,
+            min_i   = -10.0 
+        )
+        
+        self.pub_enable_arm_ctrl        = self.create_publisher(Bool,    '/arm/enable_ctrl',           10)
+        self.pub_enable_arm_arm_ctrl    = self.create_publisher(Bool,    '/arm/enable_arm_ctrl',       10)
+        self.pub_enable_arm_bucket_ctrl = self.create_publisher(Bool,    '/arm/enable_bucket_ctrl',    10)
+        self.pub_arm_target_pos         = self.create_publisher(Float64, '/arm/set_arm_target_pos',    10)
+        self.pub_bucket_target_pos      = self.create_publisher(Float64, '/arm/set_bucket_target_pos', 10)
+        self.pub_arm_move               = self.create_publisher(Bool,    '/arm/arm_move_to_pos',       10)
+        self.pub_bucket_move            = self.create_publisher(Bool,    '/arm/bucket_move_to_pos',    10)
+        self.pub_linear_spd             = self.create_publisher(Float64, '/vehicle/set_target_spd',    10)
+        self.pub_linear_mov             = self.create_publisher(Bool,    '/vehicle/move',              10)
+        self.pub_linear_stop            = self.create_publisher(Bool,    '/vehicle/stop_move',         10)
+
+        self.create_subscription(Float64, "/vehicle/speed",                lambda msg : self.vehicle_speed_callback(msg),  10)
+        self.create_subscription(Bool,    "/arm/is_arm_reached_target",    lambda msg : self.arm_reached_callback(msg),    10)
+        self.create_subscription(Bool,    "/arm/is_bucket_reached_target", lambda msg : self.bucket_reached_callback(msg), 10)
+
+        self.vehicle_speed_callback  = self.vehicleControlller.vehicle_speed_callback
+        self.arm_reached_callback    = self.armController.arm_reached_callback
+        self.bucket_reached_callback = self.armController.bucket_reached_callback 
+
+        self.get_logger().info("Initializing action server")
+        self.action_server = ActionServer(
+            node             = self,
+            action_type      = Trigger,
+            action_name      = "/arm_loader/execute_sequence",
+            execute_callback = self.execute_loader_goal,
+        )
+        self.get_logger().info("Initialize action server successfully")
+
+        self.targets = [
+            [0.24197153387468573, 0.0, 0.0],
+            [1.0, 0.21979246164780855, 0.3033429986776818],
+            [2.0, 0.22009244819553492, 0.3037867161184603],
+            [2.0, 0.22009244819553492, 0.3037867161184603],
+            [0.0, 0.8029340032443635, 0.15712545046230594]
+        ]
+
+        self.state_reset()
+
+    def vehicle_speed_callback(self, msg:Float64):
+        raise NotImplementedError
+
+    def arm_reached_callback(self, msg:Bool):
+        raise NotImplementedError
+
+    def bucket_reached_callback(self, msg:Bool):
+        raise NotImplementedError
+    
+    def state_reset(self):
+        self.loader_traj_point_no = -1
+        self.loader_traj_is_done  = True
+        self.is_cancled = False
+        self.get_logger().info("Sequence action server state resetted")
+        
+    def send_vehicle_goal(self, target_pos:float):
+        return self.vehicleControlller.control_pos(target_pos)
+
+    def execute_sequence(self):
+
+        for idx, (x, j1, j2) in enumerate(self.targets):
+
+            if self.is_cancled:
+                break
+            
+            self.get_logger().info(f"Execute Target {idx+1}/{len(self.targets)}")
+            self.loader_traj_point_no = idx
+            self.loader_traj_is_done = False
+
+            vehicle_success = False
+            loader_success = False
+
+            vehicle_thread = threading.Thread(
+                target=lambda: setattr(
+                    self,
+                    "_vehicle_result",
+                    self.send_vehicle_goal(x)
+                )
+            )
+
+            loader_thread = threading.Thread(
+                target=lambda: setattr(
+                    self,
+                    "_loader_result",
+                    self.armController.send_loader_goal(j1, j2)
+                )
+            )
+
+            # vehicle_thread.start()
+            loader_thread.start()
+
+            # vehicle_thread.join()
+            loader_thread.join()
+            vehicle_success = True
+            # vehicle_success = self._vehicle_result
+            loader_success = self._loader_result
+            
+            if not (vehicle_success and loader_success):
+                self.get_logger().error(
+                    "One of the actions failed. Stopping sequence."
+                )
+                self.get_logger().error(
+                    f"vehicle_control result = [{vehicle_success}] | arm_control result = [{loader_success}]"
+                )
+                self.is_cancled = True
+                return
+
+            self.get_logger().info(
+                "Both actions completed successfully."
+            )
+
+            time.sleep(1.0)
+
+        if not self.is_cancled:
+            self.get_logger().info("All targets completed.")
+
+        self.state_reset()
+
+    def execute_loader_goal(self, goal_handle: ServerGoalHandle):
+        self.get_logger().info("Received request to execute loader sequence.")
+
+        def process():
+            feedback = Trigger.Feedback()
+            result = Trigger.Result()
+    
+            self.loader_traj_is_done  = False
+            try:
+                self.get_logger().info("Execute action is processing")
+                while rclpy.ok():
+                    if goal_handle.is_cancel_requested:
+                        self.get_logger().info("Loader action canceled.")
+                        self.sequence_cancel_callback()
+                        goal_handle.canceled()
+                        result.success = False
+                        return result
+    
+                    is_done, is_cancled ,state_num = self.get_sequence_state()
+    
+                    feedback.state_num = state_num  
+                    goal_handle.publish_feedback(feedback)
+    
+                    if is_cancled:
+                        self.get_logger().error("Loader sequence is canceled.")
+                        goal_handle.abort()
+                        result.success = False
+                        self.state_reset()
+                        return result
+    
+                    if is_done:
+                        self.get_logger().info("Loader sequence completed successfully.")
+                        break
+
+                    rclpy.spin_once(self, timeout_sec=0.1)
+    
+            except Exception as e:
+                self.get_logger().error(f"Error during sequence execution: {e}")
+                goal_handle.abort()
+                result.success = False
+                return result
+    
+            goal_handle.succeed()
+            result.success = True
+            return result
+
+        execute_process = threading.Thread(
+            target = lambda : setattr(
+                self,
+                "_execute_result",
+                process()
+            )
+        )
+        execute_process.deamon = True
+        execute_process.start()
+        
+        process_thread = threading.Thread(target=self.execute_sequence, daemon=True)
+        process_thread.start()
+
+        execute_process.join()
+        process_thread.join() 
+
+        return self._execute_result
+
+    def sequence_cancel_callback(self):
+        self.is_cancled = True
+        self.vehicleControlller.is_cancled = True
+
+    def get_sequence_state(self):
+        return self.loader_traj_is_done, self.is_cancled, self.loader_traj_point_no
+
 class ArmPLCController:
-    def __init__(self, node:Node):
+    def __init__(self, node:SequenceExecutor):
         self.node = node
-
-        self.pub_enable_arm_ctrl = self.node.create_publisher(Bool, '/arm/enable_ctrl', 10)
-        self.pub_enable_arm_arm_ctrl = self.node.create_publisher(Bool, '/arm/enable_arm_ctrl', 10)
-        self.pub_enable_arm_bucket_ctrl = self.node.create_publisher(Bool, '/arm/enable_bucket_ctrl', 10)
-        self.pub_arm_target_pos = self.node.create_publisher(Float64, '/arm/set_arm_target_pos', 10)
-        self.pub_bucket_target_pos = self.node.create_publisher(Float64, '/arm/set_bucket_target_pos', 10)
-        self.pub_arm_move = self.node.create_publisher(Bool, '/arm/arm_move_to_pos', 10)
-        self.pub_bucket_move = self.node.create_publisher(Bool, '/arm/bucket_move_to_pos', 10)
-
-        self.node.create_subscription(Bool, "/arm/is_arm_reached_target", self.arm_reached_callback, 10)
-        self.node.create_subscription(Bool, "/arm/is_bucket_reached_target", self.bucket_reached_callback, 10)
 
         self.is_arm_reached = False
         self.is_bucket_reached = False
@@ -42,52 +235,52 @@ class ArmPLCController:
     def set_enable_arm_ctrl(self):
         msg = Bool()
         msg.data = True
-        self.pub_enable_arm_ctrl.publish(msg)
+        self.node.pub_enable_arm_ctrl.publish(msg)
 
     def set_disable_arm_ctrl(self):
         msg = Bool()
         msg.data = False
-        self.pub_enable_arm_ctrl.publish(msg)
+        self.node.pub_enable_arm_ctrl.publish(msg)
 
     def set_enable_arm_arm_ctrl(self):
         msg = Bool()
         msg.data = True
-        self.pub_enable_arm_arm_ctrl.publish(msg)
+        self.node.pub_enable_arm_arm_ctrl.publish(msg)
 
     def set_disable_arm_arm_ctrl(self):
         msg = Bool()
         msg.data = False
-        self.pub_enable_arm_arm_ctrl.publish(msg)
+        self.node.pub_enable_arm_arm_ctrl.publish(msg)
 
     def set_enable_arm_bucket_ctrl(self):
         msg = Bool()
         msg.data = True
-        self.pub_enable_arm_bucket_ctrl.publish(msg)
+        self.node.pub_enable_arm_bucket_ctrl.publish(msg)
 
     def set_disable_arm_bucket_ctrl(self):
         msg = Bool()
         msg.data = False
-        self.pub_enable_arm_bucket_ctrl.publish(msg)
+        self.node.pub_enable_arm_bucket_ctrl.publish(msg)
 
     def set_arm_target_pos(self, pos:float):
         msg = Float64()
         msg.data = pos
         self.is_arm_reached = False
-        self.pub_arm_target_pos.publish(msg)
+        self.node.pub_arm_target_pos.publish(msg)
 
     def set_bucket_target_pos(self, pos:float):
         msg = Float64()
         msg.data = pos
         self.is_bucket_reached = False
-        self.pub_bucket_target_pos.publish(msg)
+        self.node.pub_bucket_target_pos.publish(msg)
 
     def set_arm_move(self):
-        pulse_bool(self.pub_arm_move)
+        pulse_bool(self.node.pub_arm_move)
 
     def set_bucket_move(self):
-        pulse_bool(self.pub_bucket_move)
+        pulse_bool(self.node.pub_bucket_move)
 
-    def wait_until_reached(self, is_reached:callable, timeout:float=5.0):
+    def wait_until_reached(self, is_reached:callable, timeout:float=30.0):
         start_time = time.time()
         while time.time() - start_time < timeout:
             
@@ -135,14 +328,8 @@ class ArmPLCController:
             self.is_bucket_reached = False
 
 class VehicleMotionController:
-    def __init__(self, node:Node, kp:float, ki:float, kd:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float, tol:float=0.1):
+    def __init__(self, node:SequenceExecutor, kp:float, ki:float, kd:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float, tol:float=0.1):
         self.node = node
-
-        self.pub_linear_spd  = self.node.create_publisher(Float64, '/vehicle/set_target_spd', 10)
-        self.pub_linear_mov  = self.node.create_publisher(Bool,    '/vehicle/move',           10)
-        self.pub_linear_stop = self.node.create_publisher(Bool,    '/vehicle/stop_move',      10)
-
-        self.node.create_subscription(Float64, "/vehicle/speed", self.vehicle_speed_callback, 10)
 
         self._vehicle_spd  : float = 0.0
         self._vehicle_dist : float = 0.0
@@ -236,169 +423,12 @@ class VehicleMotionController:
     def set_linear_spd(self, spd:float):
         msg_spd = Float64()
         msg_spd.data = spd
-        self.pub_linear_spd.publish(msg_spd)
-        pulse_bool(self.pub_linear_mov)
+        self.node.pub_linear_spd.publish(msg_spd)
+        pulse_bool(self.node.pub_linear_mov)
 
     def set_linear_stop_mov(self):
-        pulse_bool(self.pub_linear_stop)
-    
-class SequenceExecutor(Node):
+        pulse_bool(self.node.pub_linear_stop)
 
-    def __init__(self):
-        super().__init__("load_unload_action_server")
-
-        self.armController = ArmPLCController(self)
-        self.vehicleControlller = VehicleMotionController(
-            node    = self,
-            kp      =  1.0,
-            ki      =  0.0,
-            kd      =  0.0,
-            max_cmd =  3.0,
-            min_cmd = -3.0,
-            max_i   =  10.0,
-            min_i   = -10.0 
-        )
-        
-        self.action_server = ActionServer(
-            node             = self,
-            action_type      = Trigger,
-            action_name      = "/arm_loader/execute_sequence",
-            execute_callback = self.execute_loader_goal,
-        )
-
-        self.targets = [
-            [0.24197153387468573, 0.0, 0.0],
-            [1.0, 0.21979246164780855, 0.3033429986776818],
-            [2.0, 0.22009244819553492, 0.3037867161184603],
-            [2.0, 0.22009244819553492, 0.3037867161184603],
-            [0.0, 0.8029340032443635, 0.15712545046230594]
-        ]
-
-        self.action_mutex = threading.Lock()
-
-        self.state_reset()
-
-    def state_reset(self):
-        self.loader_traj_point_no = -1
-        self.loader_traj_is_done  = True
-        self.is_cancled = False
-    
-    def send_vehicle_goal(self, target_pos:float):
-        return self.vehicleControlller.control_pos(target_pos)
-
-    def execute_sequence(self):
-
-        for idx, (x, j1, j2) in enumerate(self.targets):
-
-            if self.is_cancled:
-                break
-            
-            self.get_logger().info(f"Execute Target {idx+1}/{len(self.targets)}")
-            self.loader_traj_point_no = idx
-            self.loader_traj_is_done = False
-
-            vehicle_success = False
-            loader_success = False
-
-            vehicle_thread = threading.Thread(
-                target=lambda: setattr(
-                    self,
-                    "_vehicle_result",
-                    self.send_vehicle_goal(x)
-                )
-            )
-
-            loader_thread = threading.Thread(
-                target=lambda: setattr(
-                    self,
-                    "_loader_result",
-                    self.armController.send_loader_goal(j1, j2)
-                )
-            )
-
-            vehicle_thread.start()
-            loader_thread.start()
-
-            vehicle_thread.join()
-            loader_thread.join()
-
-            vehicle_success = self._vehicle_result
-            loader_success = self._loader_result
-            
-            if not (vehicle_success and loader_success):
-                self.get_logger().error(
-                    "One of the actions failed. Stopping sequence."
-                )
-                self.get_logger().error(
-                    f"vehicle_control result = [{vehicle_success}] | arm_control result = [{loader_success}]"
-                )
-                self.is_cancled = True
-                return
-
-            self.get_logger().info(
-                "Both actions completed successfully."
-            )
-
-            time.sleep(1.0)
-
-        if not self.is_cancled:
-            self.get_logger().info("All targets completed.")
-
-        self.state_reset()
-
-    def execute_loader_goal(self, goal_handle: ServerGoalHandle):
-        self.get_logger().info("Received request to execute loader sequence.")
-
-        process_thread = threading.Thread(target=self.execute_sequence, daemon=True)
-        process_thread.start()
-
-        feedback = Trigger.Feedback()
-        result = Trigger.Result()
-
-        self.loader_traj_is_done  = False
-        try:
-            while rclpy.ok():
-                if goal_handle.is_cancel_requested:
-                    self.get_logger().info("Loader action canceled.")
-                    self.sequence_cancel_callback()
-                    goal_handle.canceled()
-                    result.success = False
-                    return result
-
-                is_done, is_cancled ,state_num = self.get_sequence_state()
-                feedback.state_num = state_num  
-                goal_handle.publish_feedback(feedback)
-
-                if is_cancled:
-                    self.get_logger().error("Loader sequence is canceled.")
-                    goal_handle.abort()
-                    result.success = False
-                    self.state_reset()
-                    return result
-
-                if is_done:
-                    self.get_logger().info("Loader sequence completed successfully.")
-                    break
-
-                time.sleep(0.05)
-
-        except Exception as e:
-            self.get_logger().error(f"Error during sequence execution: {e}")
-            goal_handle.abort()
-            result.success = False
-            return result
-
-        goal_handle.succeed()
-        result.success = True
-        return result
-
-    def sequence_cancel_callback(self):
-        self.is_cancled = True
-        self.vehicleControlller.is_cancled = True
-
-    def get_sequence_state(self):
-        return self.loader_traj_is_done, self.is_cancled, self.loader_traj_point_no
-    
 def main(args=None):
     rclpy.init(args=args)
 
