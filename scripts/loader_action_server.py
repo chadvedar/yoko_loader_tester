@@ -16,7 +16,7 @@ def pulse_bool(publisher):
     msg.data = True
     publisher.publish(msg)
 
-    time.sleep(0.1)
+    time.sleep(0.2)
 
     msg.data = False
     publisher.publish(msg)
@@ -29,9 +29,10 @@ class SequenceExecutor(Node):
         self.armController      = ArmPLCController(self)
         self.vehicleControlller = VehicleMotionController(
             node    =  self,
-            kp      =  1.0,
-            ki      =  0.0,
-            kd      =  0.0,
+            kp      =  0.25,
+            ki      =  0.01,
+            kd      =  0.01,
+            v_nominal = 5.0,
             max_cmd =  3.0,
             min_cmd = -3.0,
             max_i   =  10.0,
@@ -67,11 +68,11 @@ class SequenceExecutor(Node):
         self.get_logger().info("Initialize action server successfully")
 
         self.targets = [
-            [0.24197153387468573, 0.0, 0.0],
-            [1.0, 0.21979246164780855, 0.3033429986776818],
-            [2.0, 0.22009244819553492, 0.3037867161184603],
-            [2.0, 0.22009244819553492, 0.3037867161184603],
-            [0.0, 0.8029340032443635, 0.15712545046230594]
+            [0.0, 0.06, 0.25],
+            [15.0, 0.3, 0.04],
+            [0.0, None, None],
+            [0.0, 0.7, 0.03],
+            [-5.0, None, None],
         ]
 
         self.state_reset()
@@ -124,15 +125,15 @@ class SequenceExecutor(Node):
                 )
             )
 
-            # vehicle_thread.start()
+            vehicle_thread.start()
             loader_thread.start()
 
-            # vehicle_thread.join()
+            vehicle_thread.join()
             loader_thread.join()
-            vehicle_success = True
-            # vehicle_success = self._vehicle_result
+            # vehicle_success = True
+            vehicle_success = self._vehicle_result
             loader_success = self._loader_result
-            
+            # loader_success = True
             if not (vehicle_success and loader_success):
                 self.get_logger().error(
                     "One of the actions failed. Stopping sequence."
@@ -143,11 +144,11 @@ class SequenceExecutor(Node):
                 self.is_cancled = True
                 return
 
+            time.sleep(2.0)
+
             self.get_logger().info(
                 "Both actions completed successfully."
             )
-
-            time.sleep(1.0)
 
         if not self.is_cancled:
             self.get_logger().info("All targets completed.")
@@ -188,7 +189,7 @@ class SequenceExecutor(Node):
                         self.get_logger().info("Loader sequence completed successfully.")
                         break
 
-                    rclpy.spin_once(self, timeout_sec=0.1)
+                    rclpy.spin_once(self, timeout_sec=0.01)
     
             except Exception as e:
                 self.get_logger().error(f"Error during sequence execution: {e}")
@@ -265,13 +266,13 @@ class ArmPLCController:
     def set_arm_target_pos(self, pos:float):
         msg = Float64()
         msg.data = pos
-        self.is_arm_reached = False
+        # self.is_arm_reached = False
         self.node.pub_arm_target_pos.publish(msg)
 
     def set_bucket_target_pos(self, pos:float):
         msg = Float64()
         msg.data = pos
-        self.is_bucket_reached = False
+        # self.is_bucket_reached = False
         self.node.pub_bucket_target_pos.publish(msg)
 
     def set_arm_move(self):
@@ -284,7 +285,7 @@ class ArmPLCController:
         start_time = time.time()
         while time.time() - start_time < timeout:
             
-            time.sleep(0.1)
+            time.sleep(0.01)
 
             if is_reached():
                 return True
@@ -292,43 +293,46 @@ class ArmPLCController:
         return False
     
     def send_loader_goal(self, j1:float=None, j2:float=None):
+        self.set_disable_arm_ctrl()
         self.set_enable_arm_ctrl()
         self.set_enable_arm_arm_ctrl()
         self.set_enable_arm_bucket_ctrl()
 
         if j1 is not None:
+            self.is_arm_reached = False
             self.set_arm_target_pos(j1)
             self.set_arm_move()
         if j2 is not None:
+            self.is_bucket_reached = False
             self.set_bucket_target_pos(j2)
             self.set_bucket_move()
 
+        print(f"arm-bucket1 {self.is_arm_reached}-{self.is_bucket_reached}")
         j1_ret = True
         if j1 is not None:
             j1_ret = self.wait_until_reached(lambda : self.is_arm_reached)
-
+        print(f"arm-bucket2 {self.is_arm_reached}-{self.is_bucket_reached}")
         j2_ret = True
         if j2 is not None:
             j2_ret = self.wait_until_reached(lambda : self.is_bucket_reached)
-            
+        print(f"arm-bucket3 {self.is_arm_reached}-{self.is_bucket_reached}")
+        print(j1_ret, j2_ret)
         return j1_ret and j2_ret
 
     def arm_reached_callback(self, msg:Bool):
         if msg.data:
             self.is_arm_reached = True
+            print(f"arm msg {msg.data}-{self.is_arm_reached}")
             self.node.get_logger().info("Arm reached target position")
-        else:
-            self.is_arm_reached = False
 
     def bucket_reached_callback(self, msg:Bool):
         if msg.data:
             self.is_bucket_reached = True
+            print(f"bucket msg {msg.data}-{self.is_bucket_reached}")
             self.node.get_logger().info("Bucket reached target position")
-        else:
-            self.is_bucket_reached = False
 
 class VehicleMotionController:
-    def __init__(self, node:SequenceExecutor, kp:float, ki:float, kd:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float, tol:float=0.1):
+    def __init__(self, node:SequenceExecutor, kp:float, ki:float, kd:float, v_nominal:float, max_cmd:float, min_cmd:float, max_i:float, min_i:float, tol:float=0.2):
         self.node = node
 
         self._vehicle_spd  : float = 0.0
@@ -336,7 +340,7 @@ class VehicleMotionController:
 
         self.reset()
         self.set_control_gain(kp, ki, kd)
-        self.set_control_limit(max_cmd, min_cmd, max_i, min_i)
+        self.set_control_limit(v_nominal, max_cmd, min_cmd, max_i, min_i)
         self.tol = tol
 
     def set_control_gain(self, kp:float, ki:float, kd:float):
@@ -344,11 +348,12 @@ class VehicleMotionController:
         self.ki = ki
         self.kd = kd
 
-    def set_control_limit(self, max_cmd:float, min_cmd:float, max_i:float, min_i:float):
+    def set_control_limit(self, v_nominal:float ,max_cmd:float, min_cmd:float, max_i:float, min_i:float):
         self.max_cmd = max_cmd
         self.min_cmd = min_cmd
         self.max_i   = max_i
         self.min_i   = min_i
+        self.v_nominal = v_nominal
 
     def reset(self):
         self._vehicle_spd  = 0.0
@@ -369,7 +374,7 @@ class VehicleMotionController:
         process = threading.Thread(target=self.control_pos, args=(target_pos,), daemon=True)
         process.start()
     
-    def control_pos(self, target_pos:float, timeout:float=5.0):
+    def control_pos(self, target_pos:float, timeout:float=60.0):
 
         start_time = time.time()
         prev_time = start_time
@@ -386,6 +391,7 @@ class VehicleMotionController:
                 break
 
             v_cmd, err = self.control_law(target_pos = target_pos, dt = dt)
+            self.node.get_logger().info(f"VehicleMotionControl, error = [{err}], command speed = [{v_cmd}]")
             self.set_linear_spd(v_cmd)
 
             self.compute_vehicle_dist(dt)
@@ -409,13 +415,14 @@ class VehicleMotionController:
     
         self.err      = target_pos - self._vehicle_dist
 
-        self.err_i   += self.err * dt
-        self.err_i    = np.clip(self.err_i, self.min_i, self.max_i)
+        # self.err_i   += self.err * dt
+        # self.err_i    = np.clip(self.err_i, self.min_i, self.max_i)
 
-        self.err_d    = (self.err - self.err_prev)/dt
-        self.err_prev = self.err
+        # self.err_d    = (self.err - self.err_prev)/dt
+        # self.err_prev = self.err
 
-        v_cmd         = self.kp * self.err + self.ki * self.err_i + self.kd * self.err_d
+        # v_cmd         = self.kp * self.err + self.ki * self.err_i + self.kd * self.err_d
+        v_cmd         = np.sign(self.err) * self.v_nominal
         v_cmd         = np.clip(v_cmd, self.min_cmd, self.max_cmd)
 
         return v_cmd, self.err
