@@ -32,7 +32,7 @@ class SequenceExecutor(Node):
             kp      =  0.25,
             ki      =  0.01,
             kd      =  0.01,
-            v_nominal = 5.0,
+            v_nominal = 4.0,
             max_cmd =  3.0,
             min_cmd = -3.0,
             max_i   =  10.0,
@@ -68,10 +68,11 @@ class SequenceExecutor(Node):
         self.get_logger().info("Initialize action server successfully")
 
         self.targets = [
-            [0.0, 0.06, 0.25],
-            [15.0, 0.3, 0.04],
-            [0.0, None, None],
-            [0.0, 0.7, 0.03],
+            [0.0, -0.4, None],
+            [0.0, None, 0.25],
+            [5.0, None, None],
+            [5.0, None, 0.0],
+            [0.0, 0.7, None],
             [-5.0, None, None],
         ]
 
@@ -295,15 +296,17 @@ class ArmPLCController:
     def send_loader_goal(self, j1:float=None, j2:float=None):
         self.set_disable_arm_ctrl()
         self.set_enable_arm_ctrl()
-        self.set_enable_arm_arm_ctrl()
-        self.set_enable_arm_bucket_ctrl()
 
         if j1 is not None:
             self.is_arm_reached = False
+            self.set_disable_arm_bucket_ctrl()
+            self.set_enable_arm_arm_ctrl()
             self.set_arm_target_pos(j1)
             self.set_arm_move()
         if j2 is not None:
             self.is_bucket_reached = False
+            self.set_disable_arm_arm_ctrl()
+            self.set_enable_arm_bucket_ctrl()
             self.set_bucket_target_pos(j2)
             self.set_bucket_move()
 
