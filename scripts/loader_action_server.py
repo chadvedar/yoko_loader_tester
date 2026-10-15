@@ -11,6 +11,8 @@ from rclpy.action.server import ServerGoalHandle
 from yoko_loader_tester.action import Trigger
 from std_msgs.msg import Bool, Int32, Int16, Float64
 
+from enum import Enum, auto
+
 def pulse_bool(publisher):
     msg = Bool()
     msg.data = True
@@ -20,7 +22,14 @@ def pulse_bool(publisher):
 
     msg.data = False
     publisher.publish(msg)
-    
+
+class VehicleLoadingState(Enum):
+    InitialPos  = auto()
+    PushToLimit = auto()
+    Scooping    = auto()
+    Lifting     = auto()
+    Fallback    = auto()
+
 class SequenceExecutor(Node):
 
     def __init__(self):
@@ -53,6 +62,7 @@ class SequenceExecutor(Node):
         self.create_subscription(Float64, "/vehicle/speed",                lambda msg : self.vehicle_speed_callback(msg),  10)
         self.create_subscription(Bool,    "/arm/is_arm_reached_target",    lambda msg : self.arm_reached_callback(msg),    10)
         self.create_subscription(Bool,    "/arm/is_bucket_reached_target", lambda msg : self.bucket_reached_callback(msg), 10)
+        self.create_subscription(Float64, "/vehicle/motor_torque",         lambda msg : self.vehicle_motor_torque_callback(msg), 10)
 
         self.vehicle_speed_callback  = self.vehicleControlller.vehicle_speed_callback
         self.arm_reached_callback    = self.armController.arm_reached_callback
@@ -74,6 +84,14 @@ class SequenceExecutor(Node):
             [5.0, None, 0.0],
             [0.0, 0.7, None],
             [-5.0, None, None],
+        ]
+
+        self.LOADING_SEQ = [
+            VehicleLoadingState.InitialPos,
+            VehicleLoadingState.PushToLimit,
+            VehicleLoadingState.Scooping,
+            VehicleLoadingState.Lifting,
+            VehicleLoadingState.Fallback
         ]
 
         self.state_reset()
@@ -98,63 +116,96 @@ class SequenceExecutor(Node):
 
     def execute_sequence(self):
 
-        for idx, (x, j1, j2) in enumerate(self.targets):
+        ret = True
+        self.loader_traj_point_no = 0
+        self.loader_traj_is_done = False
+
+        for idx, seq in enumerate(self.LOADING_SEQ):
+            time.sleep(0.5)
+
+            self.loader_traj_point_no = idx
 
             if self.is_cancled:
+                self.get_logger().info(f"Execute loading sequence cancled")
+                ret = False
                 break
             
-            self.get_logger().info(f"Execute Target {idx+1}/{len(self.targets)}")
-            self.loader_traj_point_no = idx
-            self.loader_traj_is_done = False
+            if seq == VehicleLoadingState.InitialPos:
+                ret = self.init_pos_procedure()
 
-            vehicle_success = False
-            loader_success = False
+            elif seq == VehicleLoadingState.PushToLimit:
+                ret = self.push_to_limit_procedure()
 
-            vehicle_thread = threading.Thread(
-                target=lambda: setattr(
-                    self,
-                    "_vehicle_result",
-                    self.send_vehicle_goal(x)
-                )
-            )
+            elif seq == VehicleLoadingState.Scooping:
+                ret = self.scooping_procedure()
 
-            loader_thread = threading.Thread(
-                target=lambda: setattr(
-                    self,
-                    "_loader_result",
-                    self.armController.send_loader_goal(j1, j2)
-                )
-            )
+            elif seq == VehicleLoadingState.Lifting:
+                ret = self.lifting_procedure()
 
-            vehicle_thread.start()
-            loader_thread.start()
+            elif seq == VehicleLoadingState.Fallback:
+                ret = self.fallback_procedure()
 
-            vehicle_thread.join()
-            loader_thread.join()
-            # vehicle_success = True
-            vehicle_success = self._vehicle_result
-            loader_success = self._loader_result
-            # loader_success = True
-            if not (vehicle_success and loader_success):
-                self.get_logger().error(
-                    "One of the actions failed. Stopping sequence."
-                )
-                self.get_logger().error(
-                    f"vehicle_control result = [{vehicle_success}] | arm_control result = [{loader_success}]"
-                )
-                self.is_cancled = True
-                return
+            if not ret:
+                break
 
-            time.sleep(2.0)
-
-            self.get_logger().info(
-                "Both actions completed successfully."
-            )
-
-        if not self.is_cancled:
+        if ret:
             self.get_logger().info("All targets completed.")
+        else:
+            self.get_logger().info(f"Loading sequence incompleted at state[{self.loader_traj_point_no}]")
 
         self.state_reset()
+
+    def init_pos_procedure(self, j1_pos:float=-0.4, j2_pos:float=0.25):
+            
+        self.get_logger().info(f"Execute Initial arm loading position J1=[{j1_pos}], J2=[{j2_pos}]")
+
+        if not self.armController.send_loader_goal(j1_pos, None):
+            self.get_logger().info(f"Fail execute initial scooping pos [J1_POS={j1_pos}]")
+            return False
+
+        if not self.armController.send_loader_goal(None, j2_pos):
+            self.get_logger().info(f"Fail execute initial scooping pos [J2_POS={j2_pos}]")
+            return False
+        
+        self.get_logger().info("Initial loading procedure completed successfully.")
+
+    def push_to_limit_procedure(self, tor_thresh:float=1500.0):
+        self.get_logger().info(f"Execute push_to_limit_procedure tor_thresh=[{tor_thresh}]")
+        ret = self.vehicleControlller.push_until_torque_limit(tor_thresh=tor_thresh)
+        if ret:
+            self.get_logger().info("push_to_limit procedure completed successfully.")
+        else:
+            self.get_logger().info("push_to_limit procedure fail.")
+        return ret
+
+    def scooping_procedure(self, j2_pos:float=0.0):
+        self.get_logger().info(f"Execute scooping procedure, J2_POS=[{j2_pos}]")
+
+        if not self.armController.send_loader_goal(None, j2_pos):
+            self.get_logger().info(f"Fail execute scooping pos [J2_POS={j2_pos}]")
+            return False
+
+        self.get_logger().info("scooping procedure completed successfully.")
+        return True
+
+    def lifting_procedure(self, j1_pos:float=0.0):
+        self.get_logger().info(f"Execute lifting procedure, J1_POS=[{j1_pos}]")
+
+        if not self.armController.send_loader_goal(j1_pos, None):
+            self.get_logger().info(f"Fail execute lifting pos [J1_POS={j1_pos}]")
+            return False
+
+        self.get_logger().info("lifting procedure completed successfully.")
+        return True
+
+    def fallback_procedure(self, delay_time:float=20.0):
+        self.get_logger().info(f"Execute fallback procedure, delay_time=[{delay_time}]")
+        ret = self.vehicleControlller.move_forward_w_delay(delay_time)
+        if ret:
+            self.get_logger().info("fallback procedure completed successfully.")
+        else:
+            self.get_logger().info("fallback procedure fail.")
+        return ret
 
     def execute_loader_goal(self, goal_handle: ServerGoalHandle):
         self.get_logger().info("Received request to execute loader sequence.")
@@ -226,6 +277,9 @@ class SequenceExecutor(Node):
 
     def get_sequence_state(self):
         return self.loader_traj_is_done, self.is_cancled, self.loader_traj_point_no
+
+    def vehicle_motor_torque_callback(self, msg:Float64):
+        self.vehicleControlller.vehicle_tor = msg.data
 
 class ArmPLCController:
     def __init__(self, node:SequenceExecutor):
@@ -345,6 +399,7 @@ class VehicleMotionController:
         self.set_control_gain(kp, ki, kd)
         self.set_control_limit(v_nominal, max_cmd, min_cmd, max_i, min_i)
         self.tol = tol
+        self.vehicle_tor = 0.0
 
     def set_control_gain(self, kp:float, ki:float, kd:float):
         self.kp = kp
@@ -438,6 +493,64 @@ class VehicleMotionController:
 
     def set_linear_stop_mov(self):
         pulse_bool(self.node.pub_linear_stop)
+
+    def push_until_torque_limit(self, tor_thresh:float = 1500.0, timeout:float=60.0):
+
+        start_time = time.time()
+        prev_time = start_time
+
+        self.node._logger.info(f"VehicleTorqueControl: torque thresh = {tor_thresh}")
+        while not self.is_cancled:
+            now_time = time.time()
+            dt = now_time - prev_time
+            prev_time = now_time
+
+            time_elapse = now_time - start_time
+            if time_elapse > timeout:
+                self.is_cancled = True
+                break
+
+            v_cmd = self.v_nominal
+            self.node.get_logger().info(f"VehicleTorqueControl: current torque = [{self.vehicle_tor}], command speed = [{v_cmd}]")
+            self.set_linear_spd(v_cmd)
+
+            if self.vehicle_tor >= tor_thresh:
+                self.set_linear_stop_mov()
+                break
+
+        ret = True
+        if self.is_cancled:
+            ret = False
+        else:
+            self.node._logger.info(f"VehicleTorqueControl is finished")
+
+        self.reset()
+        return ret
+
+    def move_forward_w_delay(self, delay_time:float=10.0):
+        start_time = time.time()
+
+        self.node._logger.info(f"VehicleMoveWDelay: delay_time = {delay_time}")
+        while not self.is_cancled:
+
+            now_time = time.time()
+            time_elapse = now_time - start_time
+            if time_elapse > delay_time:
+                self.set_linear_stop_mov()
+                break
+
+            v_cmd = -self.v_nominal
+            self.node.get_logger().info(f"VehicleMoveWDelay: delay_time = [{delay_time}], command speed = [{v_cmd}]")
+            self.set_linear_spd(v_cmd)
+
+        ret = True
+        if self.is_cancled:
+            ret = False
+        else:
+            self.node._logger.info(f"VehicleMoveWDelay is finished")
+
+        self.reset()
+        return ret
 
 def main(args=None):
     rclpy.init(args=args)
